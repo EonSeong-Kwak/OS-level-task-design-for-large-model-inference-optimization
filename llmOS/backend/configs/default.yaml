@@ -1,0 +1,44 @@
+seed: 42
+block_size: 16
+num_kv_blocks: 256
+phys_pages: 256
+page_size_gb: 0.25
+batch_size: 8
+alpha_prefill: 0.00002
+beta_decode: 0.001
+step_cost: 0.001
+nvme_gbps: 3.5
+cpu_gpu_gbps: 16.0
+gpu_hbm_gbps: 800.0
+lookahead: 2
+cache_layers: 2
+time_slice: 0.01
+ctx_switch_cost: 0.0005
+hunger_threshold: 0.05
+total_gpu_mem_gb: 24.0
+share_alpha: 1.0
+share_beta: 1.0
+
+w1:
+  n: 32
+  arrival_rate: 40.0
+  prompt_range: [32, 128]
+  gen_range: [32, 128]
+
+w2:
+  n: 6
+  arrival_rate: 6.0
+  prompt_range: [256, 512]
+  gen_range: [64, 128]
+
+w3:
+  n: 36
+  arrival_rate: 50.0
+  prompt_range: [32, 96]
+  gen_range: [32, 96]
+  share_alpha: 3.0
+  share_beta: 1.0
+
+w4:
+  prompt_tokens: 48
+  branches: 4
