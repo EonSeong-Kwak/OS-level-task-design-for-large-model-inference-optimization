@@ -15,15 +15,20 @@ class Block:
     resident: bool = True
     swap_location: Optional[int] = None
     used_tokens: int = 0
+    owner_tenant: str = "default"
 
 
 class BlockAllocator:
-    def __init__(self, num_blocks: int, block_size: int, vmm=None) -> None:
+    def __init__(self, num_blocks: int, block_size: int, vmm=None, allow_eviction: bool = True) -> None:
         if num_blocks <= 0 or block_size <= 0:
             raise ValueError("num_blocks and block_size must be positive")
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.vmm = vmm
+        # LRU swap-out only exists under paged memory. Contiguous worst-case
+        # pre-reservation must fail outright when the pool is exhausted (this
+        # is the fragmentation/OOM pain paging is designed to remove).
+        self.allow_eviction = allow_eviction
         self.tenant = "default"
         self.blocks = [Block(block_id=i) for i in range(num_blocks)]
         self._free: list[int] = list(range(num_blocks))
@@ -38,6 +43,10 @@ class BlockAllocator:
         out: list[int] = []
         for _ in range(n):
             if not self._free:
+                if not self.allow_eviction:
+                    for bid in out:
+                        self.free([bid])
+                    raise AllocError("contiguous pool exhausted (eviction disabled)")
                 stolen = self.steal_for_eviction(self.now, exclude=set(out))
                 if stolen is None:
                     for bid in out:
@@ -46,7 +55,7 @@ class BlockAllocator:
             bid = self._free.pop()
             if self.vmm is not None:
                 try:
-                    self.vmm.access(self.tenant, bid, True, self.now)
+                    self.vmm.pin(self.tenant, bid, self.now)
                 except IsolationError as exc:
                     self._free.append(bid)
                     for done in out:
@@ -58,6 +67,7 @@ class BlockAllocator:
             b.resident = True
             b.swap_location = None
             b.used_tokens = 0
+            b.owner_tenant = self.tenant
             b.last_access = self.now
             out.append(bid)
         return out
@@ -69,6 +79,8 @@ class BlockAllocator:
                 continue
             b.ref_count -= 1
             if b.ref_count == 0:
+                if self.vmm is not None:
+                    self.vmm.release(b.owner_tenant, bid)
                 b.is_shared = False
                 b.resident = True
                 b.used_tokens = 0
@@ -108,6 +120,8 @@ class BlockAllocator:
         if not candidates:
             return None
         victim = min(candidates, key=lambda x: x.last_access)
+        if self.vmm is not None:
+            self.vmm.release(victim.owner_tenant, victim.block_id)
         victim.resident = False
         victim.swap_location = self._swap_seq
         self._swap_seq += 1
@@ -141,7 +155,7 @@ class BlockAllocator:
         if self.vmm is None:
             return
         try:
-            self.vmm.access(self.tenant, block_id, write, self.now)
+            self.vmm.pin(self.tenant, block_id, self.now)
         except IsolationError as exc:
             raise AllocError(str(exc)) from exc
 

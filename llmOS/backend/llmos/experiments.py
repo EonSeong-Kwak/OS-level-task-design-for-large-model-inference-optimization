@@ -112,7 +112,14 @@ def run_serving(
     vmm = GPUVMM(phys_pages=phys_pages, page_size_gb=float(cfg["page_size_gb"]))
     for tenant in tenant_names:
         vmm.create_tenant(tenant, num_blocks)
-    alloc = BlockAllocator(num_blocks=num_blocks, block_size=block_size, vmm=vmm)
+    # Only paged KV memory may LRU-swap blocks; contiguous pre-reservation
+    # must reject arrivals outright when the pool is exhausted.
+    alloc = BlockAllocator(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        vmm=vmm,
+        allow_eviction=(kv_mode == "paged"),
+    )
     pt = PageTable(alloc)
     pt.mode = kv_mode
     quota = QuotaManager(total_gpu_mem_gb=float(cfg["total_gpu_mem_gb"]))
@@ -126,12 +133,17 @@ def run_serving(
         cpu_gpu_gbps=float(cfg["cpu_gpu_gbps"]),
         gpu_hbm_gbps=float(cfg["gpu_hbm_gbps"]),
     )
+    layer_gb = 0.02
+    n_layers = 8
+    cache_budget_gb = int(cfg["cache_layers"]) * layer_gb
+    quota.register(TenantQuota("__weights__", gpu_compute_share=0.0, gpu_mem_gb=cache_budget_gb))
     prefetch = PrefetchRuntime(
         bw,
-        layer_weights_gb=[0.02] * 8,
+        layer_weights_gb=[layer_gb] * n_layers,
         lookahead=int(cfg["lookahead"]),
         cache_layers=int(cfg["cache_layers"]),
         compute_s_per_gb=0.001,
+        quota=quota,
     )
     kwargs = dict(
         sim=sim,
@@ -144,8 +156,9 @@ def run_serving(
         prefetch=prefetch,
         alpha_prefill=float(cfg["alpha_prefill"]),
         beta_decode=float(cfg["beta_decode"]),
-        hunger_threshold=float(cfg["hunger_threshold"]),
+        hunger_threshold_x=float(cfg.get("hunger_threshold_x", 10.0)),
         time_slice=float(cfg["time_slice"]),
+        kv_block_gb=float(cfg.get("kv_block_gb", 0.005)),
     )
     if mode == "static":
         sched = StaticBatchingScheduler(**kwargs)
@@ -188,7 +201,9 @@ def experiment_e1(seed: int = 42) -> dict[str, Any]:
     cfg = load_config()
     cfg["seed"] = seed
     reqs = from_cfg(cfg, "w2", seed=seed)
-    blocks = 40
+    # Tight pool where worst-case contiguous pre-reservation rejects arrivals
+    # while on-demand paged allocation plus LRU swap-out still serves them.
+    blocks = 220
     base = run_serving(reqs, cfg, mode="continuous", kv_mode="contiguous", num_blocks=blocks)
     opt = run_serving(reqs, cfg, mode="continuous", kv_mode="paged", num_blocks=blocks)
     better = (
@@ -246,15 +261,24 @@ def experiment_e3(seed: int = 42) -> dict[str, Any]:
     cfg = load_config()
     cfg["seed"] = seed
     reqs = from_cfg(cfg, "w2", seed=seed)
-    base = run_serving(reqs, cfg, mode="continuous", kv_mode="paged", num_blocks=512, phys_pages=512)
-    opt = run_serving(reqs, cfg, mode="continuous", kv_mode="paged", num_blocks=64, phys_pages=64)
+    # Base pool is large enough to hold the worst-case W2 working set
+    # (6 sequences x 288 blocks = 1728), so it never swaps; the optimized
+    # pool is 288 blocks (one worst-case sequence: (4096+512)/16) and relies
+    # on LRU swap-out to multiplex all six sequences onto that single footprint.
+    base = run_serving(reqs, cfg, mode="continuous", kv_mode="paged", num_blocks=2048, phys_pages=2048)
+    opt = run_serving(reqs, cfg, mode="continuous", kv_mode="paged", num_blocks=288, phys_pages=288)
+    verdict = (
+        "小池以换出承载相同负载（显存压缩）"
+        if opt["completed"] >= base["completed"] and opt["kv_evictions"] > base["kv_evictions"]
+        else "小池换出承载部分负载，超出部分仍需拒绝"
+    )
     return _pack(
         "E3",
         "大池不分页换出 vs 小池 + LRU",
         base,
         opt,
         cfg,
-        "小池触发换出以换空间",
+        verdict,
     )
 
 
@@ -283,22 +307,43 @@ def experiment_e5(seed: int = 42) -> dict[str, Any]:
 def experiment_e6(seed: int = 42) -> dict[str, Any]:
     cfg = load_config()
     cfg["seed"] = seed
-    w3 = cfg["w3"]
+    # Overload regime: 4 slots and dense tenant bursts so slot admission is
+    # the scarce resource. Under FCFS the first bursting tenant monopolises
+    # slots; FAIR admits in proportion to the (equal) shares.
+    cfg["batch_size"] = 4
+    cfg["w3"]["arrival_rate"] = 90.0
     reqs = from_cfg(cfg, "w3", seed=seed)
-    base = run_serving(reqs, cfg, strategy="fcfs", share_alpha=1.0, share_beta=1.0)
-    opt = run_serving(
-        reqs,
-        cfg,
-        strategy="fair",
-        share_alpha=float(w3.get("share_alpha", 3.0)),
-        share_beta=float(w3.get("share_beta", 1.0)),
+    # Spec 6.2: FCFS vs FAIR under EQUAL 1:1 shares. The 3:1 weighted case is
+    # already covered by E10; FAIR here must lower cross-tenant P99 variance.
+    base = run_serving(
+        reqs, cfg, mode="continuous", strategy="fcfs", share_alpha=1.0, share_beta=1.0
     )
-    return _pack("E6", "FCFS vs FAIR（W3）", base, opt, cfg, "FAIR 压低跨租户 P99 方差或饥饿")
+    opt = run_serving(
+        reqs, cfg, mode="continuous", strategy="fair", share_alpha=1.0, share_beta=1.0
+    )
+    better = opt["tenant_p99_var"] <= base["tenant_p99_var"] + 1e-12
+    packed = _pack(
+        "E6",
+        "FCFS vs FAIR（W3, 1:1 份额）",
+        base,
+        opt,
+        cfg,
+        "FAIR 压低跨租户 P99 方差" if better else "FAIR 未压低方差，需检查配置",
+    )
+    # Per-tenant P99 bar chart (spec 6.4).
+    tenants = sorted(set(base["tenant_p99"]) | set(opt["tenant_p99"]))
+    packed["charts"]["tenant_p99"] = {
+        "tenants": tenants,
+        "baseline": [base["tenant_p99"].get(t, 0.0) for t in tenants],
+        "optimized": [opt["tenant_p99"].get(t, 0.0) for t in tenants],
+    }
+    return packed
 
 
 def experiment_e7(seed: int = 42) -> dict[str, Any]:
     cfg = load_config()
     layers = [0.4] + [0.7] * 10
+    epochs = 3
     bw = BandwidthModel(
         nvme_gbps=float(cfg["nvme_gbps"]),
         cpu_gpu_gbps=float(cfg["cpu_gpu_gbps"]),
@@ -306,12 +351,29 @@ def experiment_e7(seed: int = 42) -> dict[str, Any]:
     )
     serial = PrefetchRuntime(bw, layers, lookahead=0, cache_layers=0)
     double = PrefetchRuntime(bw, layers, lookahead=1, cache_layers=0)
-    cached = PrefetchRuntime(bw, layers, lookahead=int(cfg["lookahead"]), cache_layers=int(cfg["cache_layers"]))
-    s, d, c = serial.run(), double.run(), cached.run()
+    # All weights resident: epochs 2..3 are pure cache hits.
+    cached = PrefetchRuntime(bw, layers, lookahead=int(cfg["lookahead"]), cache_layers=len(layers))
+    s, d, c = serial.run(epochs=epochs), double.run(epochs=epochs), cached.run(epochs=epochs)
     sm, cm = serial.metrics(), cached.metrics()
+    # Ablation grid (spec 6.2): stall over lookahead x cache_layers.
+    ablation = []
+    for la in (0, 1, 2, 4):
+        for cl in (0, 2, 6, len(layers)):
+            rt = PrefetchRuntime(bw, layers, lookahead=la, cache_layers=cl)
+            m = rt.run(epochs=epochs)
+            ablation.append(
+                {
+                    "lookahead": la,
+                    "cache_layers": cl,
+                    "io_stall_ratio": m["io_stall_ratio"],
+                    "effective_compute_ratio": m["effective_compute_ratio"],
+                    "cache_hit_rate": m["cache_hit_rate"],
+                }
+            )
+    better = cm["io_stall_ratio"] <= sm["io_stall_ratio"] + 1e-12
     return {
         "id": "E7",
-        "title": "串行 vs 双缓冲 vs 预取+缓存",
+        "title": f"串行 vs 双缓冲 vs 预取+缓存（{epochs} 轮扫层）",
         "baseline": sm,
         "optimized": cm,
         "kpis": {
@@ -319,17 +381,34 @@ def experiment_e7(seed: int = 42) -> dict[str, Any]:
             "effective_compute_ratio_delta_pct": _pct_change(
                 sm["effective_compute_ratio"], cm["effective_compute_ratio"]
             ),
+            "cache_hit_rate_optimized": cm["cache_hit_rate"],
         },
-        "extra": {"double_buffer": double.metrics()},
+        "extra": {
+            "double_buffer": double.metrics(),
+            "ablation": ablation,
+            "epochs": epochs,
+            "interpretation": (
+                "Sequential layer sweeps revisit each layer after n touches, so an "
+                "LRU smaller than the full layer working set (cache_layers<n) cannot "
+                "hit. Cache benefit is therefore step-shaped in cache capacity, while "
+                "lookahead only shaves the first-pass NVMe latency up to the bandwidth "
+                "limit. This is the capacity-planning curve, not a smooth tradeoff."
+            ),
+        },
         "charts": {
             "stall_timeline": {
                 "baseline": [(i, x["stall"]) for i, x in enumerate(s["timeline"])],
                 "double": [(i, x["stall"]) for i, x in enumerate(d["timeline"])],
                 "optimized": [(i, x["stall"]) for i, x in enumerate(c["timeline"])],
-            }
+            },
+            "overlap": {
+                "serial": serial.overlap(),
+                "double": double.overlap(),
+                "optimized": cached.overlap(),
+            },
         },
         "gantt": {},
-        "verdict": "预取后 stall 不高于串行",
+        "verdict": "预取+缓存后 stall 不高于串行" if better else "预取未降低 stall，需检查参数",
         "config_digest": config_digest(cfg),
         "seed": seed,
     }
@@ -346,6 +425,9 @@ def experiment_e8(seed: int = 42) -> dict[str, Any]:
 def experiment_e9(seed: int = 42) -> dict[str, Any]:
     cfg = load_config()
     t = 0.0
+    # A page-faulted frame is fetched back over the CPU<->GPU interconnect;
+    # dirty evictions additionally pay the host swap-write cost (spec 4.4.1).
+    fault_cost = float(cfg["page_size_gb"]) / float(cfg["cpu_gpu_gbps"])
 
     def workload(phys: int, virtual: int, balloon: bool) -> dict[str, Any]:
         vmm = GPUVMM(phys_pages=phys, page_size_gb=float(cfg["page_size_gb"]))
@@ -364,6 +446,7 @@ def experiment_e9(seed: int = 42) -> dict[str, Any]:
         except IsolationError:
             blocked += 1
         reclaimed = vmm.balloon_reclaim("alpha", 4) if balloon else 0
+        vmm_time = vmm.page_faults * fault_cost + vmm.swap_write_delay
         return {
             "oversub": vmm.oversubscription_ratio(),
             "isolation_violation_rate": vmm.isolation_violation_rate(),
@@ -372,16 +455,33 @@ def experiment_e9(seed: int = 42) -> dict[str, Any]:
             "swap_outs": vmm.swap_outs,
             "blocked_cross_tenant": blocked,
             "balloon_reclaimed": reclaimed,
+            "vmm_time": vmm_time,
         }
 
     base = workload(40, 20, False)
     opt = workload(16, 20, True)
+    # Oversubscription-vs-latency Pareto sweep (spec 6.4).
+    pareto = []
+    for phys in (40, 32, 24, 16, 12, 8):
+        m = workload(phys, 20, True)
+        pareto.append(
+            {
+                "phys_pages": phys,
+                "oversubscription": m["oversub"],
+                "vmm_time": m["vmm_time"],
+                "page_faults": m["page_faults"],
+                "swap_outs": m["swap_outs"],
+            }
+        )
     return {
         "id": "E9",
         "title": "无超卖 vs 超卖 + balloon",
         "baseline": base,
         "optimized": opt,
-        "charts": {},
+        "charts": {
+            "oversub_latency": [(p["oversubscription"], p["vmm_time"]) for p in pareto],
+        },
+        "extra": {"pareto": pareto},
         "gantt": {},
         "verdict": "超卖可运行且越界拦截率为 0",
         "config_digest": config_digest(cfg),
@@ -433,13 +533,15 @@ def experiment_e10(seed: int = 42) -> dict[str, Any]:
 def experiment_e11(seed: int = 42) -> dict[str, Any]:
     cfg = load_config()
     reqs = synthetic_poisson(
-        6,
+        4,
         seed=seed,
-        arrival_rate=8.0,
-        prompt_range=(256, 384),
-        gen_range=(32, 64),
+        arrival_rate=3.0,
+        prompt_range=(2048, 3072),
+        gen_range=(256, 384),
     )
-    blocks = 28
+    # A pool around one worst-case sequence: contiguous pre-reservation must
+    # reject later arrivals; paged demand allocation multiplexes the same pool.
+    blocks = 180
     base = run_serving(reqs, cfg, kv_mode="contiguous", num_blocks=blocks, phys_pages=blocks)
     opt = run_serving(reqs, cfg, kv_mode="paged", num_blocks=blocks, phys_pages=blocks)
     return _pack("E11", "长上下文连续预占 vs 分页 OOM 率", base, opt, cfg, "分页降低长上下文 OOM 比例")

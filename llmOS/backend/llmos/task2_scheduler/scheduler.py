@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from llmos.errors import AllocError
+from llmos.errors import AllocError, QuotaOOM
 from llmos.sim.clock import DiscreteEventSim
 from llmos.sim.metrics import MetricsBus
 from llmos.task1_kv_memory.page_table import PageTable
@@ -22,6 +22,10 @@ class Strategy(Enum):
     FAIR = "fair"
 
 
+# MLFQ per-level slice budgets (in decode ticks); the last level is unlimited.
+MLFQ_BUDGETS = (2, 4, 10**9)
+
+
 class BaseScheduler(ABC):
     def __init__(
         self,
@@ -34,9 +38,11 @@ class BaseScheduler(ABC):
         beta_decode: float = 1e-3,
         quota: Optional[QuotaManager] = None,
         mps: Optional[MPSScheduler] = None,
-        hunger_threshold: float = 0.05,
+        hunger_threshold_x: float = 10.0,
         time_slice: float = 0.01,
         prefetch: Optional[PrefetchRuntime] = None,
+        kv_block_gb: float = 0.005,
+        tenant_aware: bool = False,
     ) -> None:
         self.sim = sim
         self.batch_size = batch_size
@@ -48,8 +54,12 @@ class BaseScheduler(ABC):
         self.quota = quota
         self.mps = mps
         self.prefetch = prefetch
-        self.hunger_threshold = hunger_threshold
+        self.hunger_threshold_x = hunger_threshold_x
         self.time_slice = time_slice
+        self.kv_block_gb = kv_block_gb
+        # Only tenant-aware strategies (FAIR) route each tick through the
+        # weighted MPS owner; plain FCFS/SJF/preemptive do not throttle tenants.
+        self.tenant_aware = tenant_aware
         self.waiting: list[Request] = []
         self.running: list[Request] = []
         self.finished: list[Request] = []
@@ -58,7 +68,9 @@ class BaseScheduler(ABC):
         self.idle_tick = step_cost
         self._scheduled = False
         self.gantt: list[dict] = []
-        self.tokens: dict[str, float] = {}
+        # Per-tenant count of admitted ticks; FAIR ranks tenants by
+        # admitted/share so the token source equals the MPS share source.
+        self.tenant_admitted: dict[str, float] = {}
         self.pipeline_log: list[str] = []
         self.decode_ticks = 0
         self.peak_kv_util = 0.0
@@ -84,29 +96,33 @@ class BaseScheduler(ABC):
             return True
         return self.quota.allow_slice(req.tenant, self.step_cost)
 
+    def _tenant_share(self, tenant: str) -> float:
+        """Single share source: same sa/sb config feeds both MPS and FAIR."""
+        if self.mps is not None:
+            t = self.mps.tenants.get(tenant)
+            if t is not None:
+                return max(t.share, 1e-9)
+        if self.quota is not None:
+            q = self.quota.tenants.get(tenant)
+            if q is not None:
+                return max(q.gpu_compute_share, 1e-9)
+        return 1.0
+
     def _confirm_slice(self, batch: List[Request]) -> tuple[List[Request], float]:
-        """Quota + MPS decide which tenants may run this DecodeTick."""
+        """Quota + MPS bookkeeping for this DecodeTick.
+
+        MPS time-slice ownership is used for accounting/display only; it never
+        stalls another tenant's in-flight requests for a whole tick. Tenant
+        fairness is enforced at slot ADMISSION (FAIR ranking in _pick_batch),
+        which is the resource that is actually scarce under overload.
+        """
         extra = 0.0
         owner: Optional[str] = None
         present = {r.tenant for r in batch}
         if self.mps and present:
-            ranked = []
-            for name in present:
-                t = self.mps.tenants.get(name)
-                share = t.share if t is not None else 1.0
-                acc = t.accumulated if t is not None else 0.0
-                ranked.append((acc / max(share, 1e-9), name))
-            owner = min(ranked)[1]
+            owner = self.mps.select_window(present, self.sim.now)
             extra = self.mps.run_slice(owner, self.sim.now)
-        admitted: list[Request] = []
-        for req in batch:
-            if owner is not None and req.tenant != owner:
-                continue
-            if not self._quota_ok(req):
-                continue
-            admitted.append(req)
-        if not admitted:
-            admitted = [r for r in batch if self._quota_ok(r)]
+        admitted = [r for r in batch if self._quota_ok(r)]
         return admitted, extra
 
     def _sort_waiting(self, strategy: Strategy) -> None:
@@ -114,18 +130,32 @@ class BaseScheduler(ABC):
             self.waiting.sort(key=lambda r: (r.remaining, r.arrival_time))
         elif strategy == Strategy.PREEMPTIVE:
             self.waiting.sort(key=lambda r: (-r.priority, r.arrival_time))
+        elif strategy == Strategy.MLFQ:
+            # Lowest queue level first; within a level respect arrival order.
+            self.waiting.sort(key=lambda r: (r.mlfq_level, r.arrival_time))
         elif strategy == Strategy.FAIR:
-            for r in self.waiting:
-                self.tokens.setdefault(r.tenant, 1.0)
-            self.waiting.sort(key=lambda r: (-self.tokens.get(r.tenant, 1.0), r.arrival_time))
+            # Weighted fair ranking: tenants served least relative to their
+            # share go first (same share source as MPS, see _tenant_share).
+            self.waiting.sort(
+                key=lambda r: (
+                    self.tenant_admitted.get(r.tenant, 0.0) / self._tenant_share(r.tenant),
+                    r.arrival_time,
+                )
+            )
         else:
             self.waiting.sort(key=lambda r: r.arrival_time)
+
+    def _release_quota(self, req: Request) -> None:
+        if self.quota is not None and req.mem_reserved_gb > 0:
+            self.quota.free_mem(req.tenant, req.mem_reserved_gb)
+            req.mem_reserved_gb = 0.0
 
     def _reap_finished(self) -> None:
         still: list[Request] = []
         for req in self.running:
             if req.state == ReqState.FINISHED:
                 self.page_table.free(req.seq_id)
+                self._release_quota(req)
                 self.finished.append(req)
                 self.metrics.inc("completed")
                 self.metrics.observe("latency", req.finish_time - req.arrival_time)
@@ -147,21 +177,36 @@ class BaseScheduler(ABC):
         self.metrics.inc("oom")
         if req.seq_id >= 0:
             self.page_table.free(req.seq_id)
+        self._release_quota(req)
 
     def _ensure_seq(self, req: Request) -> bool:
         if req.seq_id >= 0:
             return True
         try:
-            if self.quota and not self.quota.alloc_mem(req.tenant, 0.01):
-                self._fail(req)
-                return False
+            # Reserve the cgroups hard-limit quota for the worst-case KV
+            # footprint (prompt + max generation), block-granular.
+            bs = self.page_table.allocator.block_size
+            need_blocks = (req.prompt_len + req.max_tokens + bs - 1) // bs
+            need_gb = need_blocks * self.kv_block_gb
+            if self.quota and not self.quota.alloc_mem(req.tenant, need_gb):
+                raise QuotaOOM(f"tenant {req.tenant} over hard mem cap")
+            req.mem_reserved_gb = need_gb
             req.seq_id = self.page_table.new_sequence(req.max_tokens + req.prompt_len)
             for _ in range(req.prompt_len):
                 self.page_table.append_token(req.seq_id)
             return True
-        except AllocError:
+        except (AllocError, QuotaOOM):
             self._fail(req)
             return False
+
+    def _charge_mlfq(self, req: Request) -> None:
+        """A request that exhausts its level budget is demoted one level."""
+        if req.mlfq_budget <= 0:
+            req.mlfq_budget = MLFQ_BUDGETS[min(req.mlfq_level, len(MLFQ_BUDGETS) - 1)]
+        req.mlfq_budget -= 1
+        if req.mlfq_budget <= 0 and req.mlfq_level < len(MLFQ_BUDGETS) - 1:
+            req.mlfq_level += 1
+            req.mlfq_budget = MLFQ_BUDGETS[req.mlfq_level]
 
     @abstractmethod
     def _pick_batch(self) -> List[Request]:
@@ -185,9 +230,13 @@ class BaseScheduler(ABC):
         admitted, mps_extra = self._confirm_slice(batch)
         self.ctx_switch_time += mps_extra
         now = self.sim.now
+        # Hunger threshold = x * observed average decode-tick duration
+        # (spec 4.2.3: default 10x average decode time), not an absolute second.
+        avg_tick = self.busy_time / max(1, self.decode_ticks - 1)
+        theta = self.hunger_threshold_x * max(avg_tick, self.step_cost)
         for r in self.waiting:
             wait = now - (r.last_wait_start if r.last_wait_start >= 0 else r.arrival_time)
-            if wait > self.hunger_threshold:
+            if wait > theta:
                 self.ever_hungry.add(r.rid)
         stall = 0.0
         if self.prefetch is not None:
@@ -215,8 +264,9 @@ class BaseScheduler(ABC):
                     continue
                 req.step(self.sim.now)
                 self.page_table.append_token(req.seq_id)
-                if req.tenant in self.tokens:
-                    self.tokens[req.tenant] = max(0.0, self.tokens[req.tenant] - 1.0)
+                self.tenant_admitted[req.tenant] = self.tenant_admitted.get(req.tenant, 0.0) + 1.0
+                if getattr(self, "strategy", None) == Strategy.MLFQ:
+                    self._charge_mlfq(req)
             except AllocError:
                 self._fail(req)
 
@@ -309,6 +359,7 @@ class StaticBatchingScheduler(BaseScheduler):
 
 class ContinuousBatchingScheduler(BaseScheduler):
     def __init__(self, *a, strategy: Strategy = Strategy.FCFS, **kw) -> None:
+        kw.setdefault("tenant_aware", strategy == Strategy.FAIR)
         super().__init__(*a, **kw)
         self.strategy = strategy
 
@@ -318,6 +369,19 @@ class ContinuousBatchingScheduler(BaseScheduler):
             self.running.sort(key=lambda r: r.priority)
             while self.waiting and self.running and self.waiting[0].priority > self.running[0].priority:
                 victim = self.running.pop(0)
+                victim.state = ReqState.PREEMPTED
+                victim.last_wait_start = self.sim.now
+                self.waiting.append(victim)
+                self._sort_waiting(self.strategy)
+        if self.strategy == Strategy.MLFQ and self.waiting:
+            # A demoted (lower-priority) in-flight request yields its slot to
+            # a waiting request that still sits in a higher MLFQ queue.
+            while self.running and self.waiting:
+                victim = max(self.running, key=lambda r: (r.mlfq_level, r.arrival_time))
+                best = min(self.waiting, key=lambda r: (r.mlfq_level, r.arrival_time))
+                if best.mlfq_level >= victim.mlfq_level:
+                    break
+                self.running.remove(victim)
                 victim.state = ReqState.PREEMPTED
                 victim.last_wait_start = self.sim.now
                 self.waiting.append(victim)
@@ -332,8 +396,6 @@ class ContinuousBatchingScheduler(BaseScheduler):
             if not self._quota_ok(req):
                 still_wait.append(req)
                 continue
-            if self.strategy == Strategy.FAIR:
-                self.tokens[req.tenant] = self.tokens.get(req.tenant, 1.0) + 0.15
             admitted.append(req)
             slots -= 1
         self.waiting = still_wait

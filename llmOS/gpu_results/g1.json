@@ -1,0 +1,228 @@
+{
+  "experiment": "G1",
+  "maps_to": "E1",
+  "prompt_len_actual": 32,
+  "max_new_tokens_actual": 32,
+  "reserved_budget_per_seq": 2048,
+  "reserve_over_actual_x": 32.0,
+  "environment": {
+    "captured_at": "2026-11-16T12:37:20+00:00",
+    "host": "SJG",
+    "gpu": "NVIDIA GeForce RTX 5060",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "python": "3.12.10",
+    "transformers": "5.3.0",
+    "model": "D:\\Python\\data\\Qwen2.5-0.5B",
+    "dtype": "float16"
+  },
+  "dedicated_vram_gb": 7.96,
+  "fit_rule": "ok and peak_mem_gb <= 0.98 * dedicated VRAM (WDDM host-shared spill counts as NOT fit)",
+  "max_concurrency": {
+    "static_prealloc": 192,
+    "dynamic_ondemand": 640
+  },
+  "concurrency_gain_x": 3.33,
+  "direction_rule": "dynamic max N >= static max N (or static OOMs first)",
+  "verdict": "CONSISTENT_WITH_SIM_E1",
+  "records": [
+    {
+      "engine": "static_prealloc",
+      "n": 64,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 0.529,
+      "peak_mem_gb": 3.242,
+      "kv_cache_gb": 1.611,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 64,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.62,
+      "peak_mem_gb": 1.68,
+      "kv_cache_gb": 0.05,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 96,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 0.25,
+      "peak_mem_gb": 4.36,
+      "kv_cache_gb": 2.416,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 96,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.307,
+      "peak_mem_gb": 2.016,
+      "kv_cache_gb": 0.075,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 128,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 0.332,
+      "peak_mem_gb": 5.479,
+      "kv_cache_gb": 3.221,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 128,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.297,
+      "peak_mem_gb": 2.358,
+      "kv_cache_gb": 0.101,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 160,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 0.437,
+      "peak_mem_gb": 6.597,
+      "kv_cache_gb": 4.027,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 160,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.285,
+      "peak_mem_gb": 2.704,
+      "kv_cache_gb": 0.126,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 192,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 0.649,
+      "peak_mem_gb": 7.715,
+      "kv_cache_gb": 4.832,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 192,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.407,
+      "peak_mem_gb": 3.035,
+      "kv_cache_gb": 0.151,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 256,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 2.299,
+      "peak_mem_gb": 9.951,
+      "kv_cache_gb": 6.442,
+      "notes": "",
+      "vram_exceeded": true
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 256,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.831,
+      "peak_mem_gb": 3.702,
+      "kv_cache_gb": 0.201,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 320,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 6.93,
+      "peak_mem_gb": 12.19,
+      "kv_cache_gb": 8.053,
+      "notes": "",
+      "vram_exceeded": true
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 320,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 1.825,
+      "peak_mem_gb": 4.389,
+      "kv_cache_gb": 0.252,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 512,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 24.659,
+      "peak_mem_gb": 18.898,
+      "kv_cache_gb": 12.885,
+      "notes": "",
+      "vram_exceeded": true
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 512,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 2.799,
+      "peak_mem_gb": 6.399,
+      "kv_cache_gb": 0.403,
+      "notes": "",
+      "vram_exceeded": false
+    },
+    {
+      "engine": "static_prealloc",
+      "n": 640,
+      "ok": false,
+      "oom": true,
+      "elapsed_s": null,
+      "peak_mem_gb": 22.078,
+      "kv_cache_gb": null,
+      "notes": "CUDA out of memory. Tried to allocate 5.80 GiB. GPU 0 has a total capacity of 7.96 GiB of which 0 bytes is free. Of the allocated memory 15.97 GiB is allocated by PyTorch, and 1.02 GiB is reserved by ",
+      "vram_exceeded": true
+    },
+    {
+      "engine": "dynamic_ondemand",
+      "n": 640,
+      "ok": true,
+      "oom": false,
+      "elapsed_s": 3.568,
+      "peak_mem_gb": 7.749,
+      "kv_cache_gb": 0.503,
+      "notes": "",
+      "vram_exceeded": false
+    }
+  ]
+}

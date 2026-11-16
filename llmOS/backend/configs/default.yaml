@@ -1,11 +1,19 @@
+# Frozen default config (spec Appendix A). Do not change mid-experiment;
+# sensitivity analysis must be a separate section with a config digest.
 seed: 42
 block_size: 16
-num_kv_blocks: 256
-phys_pages: 256
+# Virtual KV block pool (spec Appendix A: 1024). Physical VMM frames default
+# to the same size so the integration path behaves like a resident FakeVMM;
+# virtualization-pressure experiments (E9/E11/E13) pass a smaller phys_pages
+# explicitly, matching the Appendix's phys_pages=64 stress setting.
+num_kv_blocks: 1024
+phys_pages: 1024
 page_size_gb: 0.25
+# Effective GB per resident KV block, used for cgroups memory accounting.
+kv_block_gb: 0.005
 batch_size: 8
-alpha_prefill: 0.00002
-beta_decode: 0.001
+alpha_prefill: 0.00002      # seconds per prefill token
+beta_decode: 0.001          # seconds per decode iteration (per batch)
 step_cost: 0.001
 nvme_gbps: 3.5
 cpu_gpu_gbps: 16.0
@@ -14,31 +22,34 @@ lookahead: 2
 cache_layers: 2
 time_slice: 0.01
 ctx_switch_cost: 0.0005
-hunger_threshold: 0.05
+# Hunger threshold as a MULTIPLE of the observed average decode-tick duration
+# (spec 4.2.3 / Appendix A key hunger_threshold_x: 10).
+hunger_threshold_x: 10
 total_gpu_mem_gb: 24.0
 share_alpha: 1.0
 share_beta: 1.0
 
-w1:
+w1:                # short dialogues (ShareGPT-like)
   n: 32
   arrival_rate: 40.0
   prompt_range: [32, 128]
   gen_range: [32, 128]
 
-w2:
+w2:                # long context: spec 6.1 freezes prompts 2k-8k, gen 256-1024
   n: 6
   arrival_rate: 6.0
-  prompt_range: [256, 512]
-  gen_range: [64, 128]
+  prompt_range: [2048, 4096]
+  gen_range: [256, 512]
 
-w3:
+w3:                # multi-tenant burst; E6 evaluates the 1:1 case, E10 the 3:1 case
   n: 36
   arrival_rate: 50.0
   prompt_range: [32, 96]
   gen_range: [32, 96]
   share_alpha: 3.0
   share_beta: 1.0
+  burst: 6            # 6 consecutive arrivals per tenant -> burst contention
 
-w4:
+w4:                # parallel sampling / COW
   prompt_tokens: 48
   branches: 4

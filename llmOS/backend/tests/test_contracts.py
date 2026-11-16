@@ -59,3 +59,26 @@ def test_clock_no_sleep_and_tie_break():
     sim.schedule(1, lambda: order.append("b"), priority=0)
     sim.run(2)
     assert order == ["b", "a"]
+
+
+def test_prefetch_decode_step_contract():
+    """§5.3: PrefetchRuntime.decode_step 必须是 async，且不引入真实睡眠。"""
+    import asyncio
+    import inspect
+
+    from llmos.task3_runtime.prefetch_runtime import PrefetchRuntime
+    from llmos.task3_runtime.storage_model import BandwidthModel
+
+    assert inspect.iscoroutinefunction(PrefetchRuntime.decode_step)
+
+    bw = BandwidthModel()
+    layers = [0.5] * 4
+    serial = PrefetchRuntime(bw, layers, lookahead=0, cache_layers=0)
+    stall = asyncio.run(serial.decode_step(0))
+    assert stall > 0
+    assert serial.stall == stall
+    assert serial.compute > 0
+
+    # 与 tick 路径等价：同样配置下首个 decode slice 的 stall 相同
+    twin = PrefetchRuntime(bw, layers, lookahead=0, cache_layers=0)
+    assert twin.tick(DiscreteEventSim()) == stall

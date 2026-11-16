@@ -28,6 +28,11 @@ class Request:
     wait_accum: float = 0.0
     last_wait_start: float = -1.0
     remaining_slice: float = 0.0
+    # Tenant memory quota reserved (and released on finish/fail), in GB.
+    mem_reserved_gb: float = 0.0
+    # MLFQ bookkeeping: current queue level and remaining slice budget.
+    mlfq_level: int = 0
+    mlfq_budget: int = 0
 
     @property
     def is_done(self) -> bool:

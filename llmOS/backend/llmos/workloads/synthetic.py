@@ -13,13 +13,16 @@ def synthetic_poisson(
     prompt_range: tuple[int, int] = (32, 128),
     gen_range: tuple[int, int] = (32, 128),
     tenants: tuple[str, ...] = ("alpha", "beta"),
+    burst: int = 1,
 ) -> List[Request]:
     rng = random.Random(seed)
     t = 0.0
     out: list[Request] = []
     for i in range(n):
         t += rng.expovariate(arrival_rate)
-        tenant = tenants[i % len(tenants)]
+        # burst>1 groups consecutive arrivals into one tenant, modeling a
+        # tenant-level traffic burst (W3 fairness scenario in spec 6.1).
+        tenant = tenants[(i // max(1, burst)) % len(tenants)]
         out.append(
             Request(
                 rid=i + 1,
@@ -43,6 +46,7 @@ def from_cfg(cfg: dict[str, Any], which: str, seed: int | None = None) -> List[R
         arrival_rate=float(w["arrival_rate"]),
         prompt_range=(int(pr[0]), int(pr[1])),
         gen_range=(int(gr[0]), int(gr[1])),
+        burst=int(w.get("burst", 1)),
     )
 
 

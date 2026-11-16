@@ -241,3 +241,167 @@ def test_missing_kpis_are_now_reported():
     assert e12["optimized"]["max_model_gb"] >= e12["baseline"]["max_model_gb"]
     e13 = run_experiment("E13", seed=2)
     assert e13["extra"]["optimized_tenants"] == 8
+
+
+# ---------------------------------------------------------------------------
+# Spec-alignment additions: real long-context pressure, FAIR share source,
+# MLFQ demotion, block-granular quotas, cache quota, VMM pin/dirty swap,
+# multi-epoch prefetch cache hits, E9 Pareto sweep, and the trace loader.
+# ---------------------------------------------------------------------------
+
+
+def test_long_context_w2_is_spec_sized():
+    from llmos.config import load_config
+    from llmos.workloads.synthetic import from_cfg
+
+    w2 = load_config()["w2"]
+    assert tuple(w2["prompt_range"]) == (2048, 4096)
+    assert tuple(w2["gen_range"]) == (256, 512)
+    reqs = from_cfg(load_config(), "w2", seed=42)
+    assert reqs[0].prompt_len >= 2048
+
+
+def test_contiguous_pool_exhaustion_rejects_without_eviction():
+    reqs = _reqs(
+        (0.0, 256, 64, "alpha", 0),
+        (0.001, 256, 64, "beta", 0),
+    )
+    cont = run_serving(reqs, kv_mode="contiguous", num_blocks=24, phys_pages=24)
+    paged = run_serving(reqs, kv_mode="paged", num_blocks=24, phys_pages=24)
+    assert cont["oom"] >= 1
+    assert cont["kv_evictions"] == 0
+    assert paged["completed"] >= cont["completed"]
+    assert paged["oom"] <= cont["oom"]
+
+
+def test_e1_paged_reduces_oom_under_w2_pressure():
+    e1 = run_experiment("E1", seed=42)
+    assert e1["optimized"]["oom_ratio"] < e1["baseline"]["oom_ratio"]
+
+
+def test_fair_lowers_tenant_variance_under_burst():
+    e6 = run_experiment("E6", seed=42)
+    assert e6["optimized"]["tenant_p99_var"] < e6["baseline"]["tenant_p99_var"]
+    assert "tenant_p99" in e6["charts"]
+
+
+def test_mlfq_demotes_long_running_request():
+    from llmos.experiments import _drive
+    from llmos.sim.clock import DiscreteEventSim
+    from llmos.sim.metrics import MetricsBus
+    from llmos.task1_kv_memory.kv_block_allocator import BlockAllocator
+    from llmos.task1_kv_memory.page_table import PageTable
+    from llmos.task2_scheduler.scheduler import ContinuousBatchingScheduler
+
+    sim = DiscreteEventSim()
+    pt = PageTable(BlockAllocator(64, 16))
+    sched = ContinuousBatchingScheduler(
+        sim=sim,
+        batch_size=4,
+        step_cost=0.001,
+        page_table=pt,
+        metrics=MetricsBus(),
+        strategy=Strategy.MLFQ,
+    )
+    long_req = Request(rid=1, arrival_time=0.0, prompt_len=8, max_tokens=80, tenant="alpha", priority=0)
+    short_req = Request(rid=2, arrival_time=0.02, prompt_len=8, max_tokens=4, tenant="beta", priority=0)
+    sched.submit(long_req)
+    sched.submit(short_req)
+    _drive(sched, [])
+    # The 80-token request burns the q0 (2 ticks) and q1 (4 ticks) budgets.
+    assert long_req.mlfq_level >= 1
+    assert long_req.state.name == "FINISHED"
+
+
+def test_quota_reservation_is_block_granular_and_released():
+    reqs = _reqs((0.0, 100, 52, "alpha", 0))
+    r = run_serving(reqs, mem_cap=0.04)  # ceil(152/16)=10 blocks * 0.005 = 0.05 > 0.04
+    assert r["oom"] == 1
+    loose = run_serving(reqs, mem_cap=8.0)
+    assert loose["completed"] == 1
+
+
+def test_weight_cache_is_charged_against_quota():
+    from llmos.task3_runtime.prefetch_runtime import PrefetchRuntime
+    from llmos.task3_runtime.quota_manager import QuotaManager, TenantQuota
+
+    qm = QuotaManager(total_gpu_mem_gb=1.0)
+    qm.register(TenantQuota("__weights__", gpu_compute_share=0.0, gpu_mem_gb=0.05))
+    rt = PrefetchRuntime(
+        BandwidthModel(),
+        [0.02] * 6,
+        lookahead=1,
+        cache_layers=4,
+        quota=qm,
+    )
+    m = rt.run(epochs=2)
+    used = qm.used["__weights__"]
+    assert used <= 0.05 + 1e-9
+    assert m["cache_hits"] > 0
+
+
+def test_pinned_vmm_frames_cannot_be_evicted():
+    vmm = GPUVMM(phys_pages=2, page_size_gb=0.25)
+    vmm.create_tenant("alpha", 4)
+    vmm.pin("alpha", 0, 0.0)
+    vmm.pin("alpha", 1, 0.0)
+    try:
+        vmm.pin("alpha", 2, 0.0)
+        assert False, "pinned frames must not be evictable"
+    except IsolationError:
+        pass
+    vmm.release("alpha", 0)
+    ppn = vmm.pin("alpha", 2, 0.0)
+    assert ppn in (0, 1)
+
+
+def test_dirty_frame_release_pays_swap_write():
+    dirty = GPUVMM(phys_pages=1, page_size_gb=0.25)
+    dirty.create_tenant("alpha", 2)
+    dirty.access("alpha", 0, True, 0.0)
+    dirty.release("alpha", 0)
+    assert dirty.swap_write_delay > 0.0
+
+    clean = GPUVMM(phys_pages=1, page_size_gb=0.25)
+    clean.create_tenant("alpha", 2)
+    clean.access("alpha", 0, False, 0.0)
+    clean.release("alpha", 0)
+    assert clean.swap_write_delay == 0.0
+
+
+def test_e7_multi_epoch_cache_ablation():
+    e7 = run_experiment("E7", seed=42)
+    ablation = e7["extra"]["ablation"]
+    assert len(ablation) == 16
+    assert e7["optimized"]["cache_hit_rate"] > 0.5
+    full_cache = [a for a in ablation if a["cache_layers"] == 11]
+    no_cache = [a for a in ablation if a["cache_layers"] == 0]
+    assert min(a["io_stall_ratio"] for a in full_cache) < max(
+        a["io_stall_ratio"] for a in no_cache
+    )
+
+
+def test_e9_oversub_pareto_is_monotone():
+    e9 = run_experiment("E9", seed=42)
+    pareto = e9["extra"]["pareto"]
+    oversubs = [p["oversubscription"] for p in pareto]
+    times = [p["vmm_time"] for p in pareto]
+    assert oversubs == sorted(oversubs)
+    assert times == sorted(times)
+    assert times[-1] > times[0]
+
+
+def test_trace_loader_jsonl_aliases_and_sorting(tmp_path):
+    from llmos.workloads.trace_loader import load_jsonl_trace
+
+    p = tmp_path / "trace.jsonl"
+    p.write_text(
+        '{"t": 0.2, "prompt_len": 10, "output_tokens": 5}\n'
+        '{"arrival_time": 0.1, "input_tokens": 20, "gen_tokens": 8, "priority": 2, "tenant": "beta"}\n',
+        encoding="utf-8",
+    )
+    reqs = load_jsonl_trace(p)
+    assert [r.arrival_time for r in reqs] == [0.1, 0.2]
+    assert reqs[0].prompt_len == 20 and reqs[0].max_tokens == 8
+    assert reqs[0].priority == 2 and reqs[0].tenant == "beta"
+    assert reqs[1].tenant == "alpha"  # row 0 without tenant rotates to alpha

@@ -1,0 +1,95 @@
+{
+  "experiment": "CALIBRATION",
+  "note": "Sensitivity appendix only; frozen sim constants are not rewritten (tech-plan §4.3.1). Timing on a tiny eager model on a desktop GPU is launch-overhead bound; use fitted marginal rates, not the raw apparent ms/token ratio.",
+  "environment": {
+    "captured_at": "2026-11-16T12:37:33+00:00",
+    "host": "SJG",
+    "gpu": "NVIDIA GeForce RTX 5060",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "python": "3.12.10",
+    "transformers": "5.3.0",
+    "model": "D:\\Python\\data\\Qwen2.5-0.5B",
+    "dtype": "float16"
+  },
+  "measured": {
+    "prefill": [
+      {
+        "prompt_len": 64,
+        "total_ms": 40.551,
+        "apparent_ms_per_token": 0.6336
+      },
+      {
+        "prompt_len": 128,
+        "total_ms": 42.884,
+        "apparent_ms_per_token": 0.335
+      },
+      {
+        "prompt_len": 256,
+        "total_ms": 39.462,
+        "apparent_ms_per_token": 0.1541
+      },
+      {
+        "prompt_len": 512,
+        "total_ms": 48.639,
+        "apparent_ms_per_token": 0.095
+      },
+      {
+        "prompt_len": 1024,
+        "total_ms": 88.232,
+        "apparent_ms_per_token": 0.0862
+      },
+      {
+        "prompt_len": 2048,
+        "total_ms": 276.338,
+        "apparent_ms_per_token": 0.1349
+      }
+    ],
+    "prefill_fit_total_ms_vs_len": {
+      "fixed_overhead_ms": 10.266,
+      "marginal_ms_per_token": 0.11769,
+      "r2": 0.9143
+    },
+    "decode": [
+      {
+        "batch": 1,
+        "ms_per_step": 31.2633
+      },
+      {
+        "batch": 2,
+        "ms_per_step": 34.8031
+      },
+      {
+        "batch": 4,
+        "ms_per_step": 36.7812
+      },
+      {
+        "batch": 8,
+        "ms_per_step": 37.7459
+      },
+      {
+        "batch": 16,
+        "ms_per_step": 35.4885
+      },
+      {
+        "batch": 32,
+        "ms_per_step": 41.4062
+      }
+    ],
+    "decode_fit_ms_vs_batch": {
+      "fixed_overhead_ms": 33.873,
+      "marginal_ms_per_extra_batch": 0.22623,
+      "r2": 0.6356
+    },
+    "kv_bytes_per_token_b1": 12288.0,
+    "n_layers": 24,
+    "n_kv_heads": 2,
+    "head_dim": 64
+  },
+  "frozen_sim_constants": {
+    "alpha_prefill": 2e-05,
+    "beta_decode": 0.001,
+    "block_size": 16,
+    "kv_block_gb": 0.005
+  }
+}

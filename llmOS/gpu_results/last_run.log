@@ -1,0 +1,15 @@
+loading D:\Python\data\Qwen2.5-0.5B (torch.float16) ...
+GPU: NVIDIA GeForce RTX 5060  weights=1.00 GB
+N= 64  static(reserve 2048): 3.242GB   dynamic(actual 64): 1.68GB
+N= 96  static(reserve 2048): 4.36GB   dynamic(actual 64): 2.016GB
+N=128  static(reserve 2048): 5.479GB   dynamic(actual 64): 2.358GB
+N=160  static(reserve 2048): 6.597GB   dynamic(actual 64): 2.704GB
+N=192  static(reserve 2048): 7.715GB   dynamic(actual 64): 3.035GB
+N=256  static(reserve 2048): 9.951GB   dynamic(actual 64): 3.702GB
+N=320  static(reserve 2048): 12.19GB   dynamic(actual 64): 4.389GB
+N=512  static(reserve 2048): 18.898GB   dynamic(actual 64): 6.399GB
+N=640  static(reserve 2048): OOM   dynamic(actual 64): 7.749GB
+G1 verdict: CONSISTENT_WITH_SIM_E1  (static max N=192, dynamic max N=640)
+calibration written: E:\大模型推理系统优化\repo\llmOS\gpu_results\calibration.json
+  prefill fit: fixed=10.266ms marginal=0.11769ms/token R2=0.9143
+  decode  fit: fixed=33.873ms slope=0.22623ms/batch R2=0.6356

@@ -7,9 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app import db as database
+from app.gpu_jobs import router as gpu_backing_router
 from llmos.experiments import EXPERIMENTS, run_experiment
 
 app = FastAPI(title="llmOS API", version="1.0.0")
+app.include_router(gpu_backing_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -39,11 +41,11 @@ def list_experiments() -> dict[str, Any]:
     catalog = {
         "E1": "连续预占 vs KV 分页",
         "E2": "分页 vs 分页 + COW",
-        "E3": "分页 vs 分页 + LRU 换出",
+        "E3": "大池不换出 vs 小池 + LRU",
         "E4": "静态批 vs 持续批 FCFS",
         "E5": "FCFS vs SJF vs 抢占",
-        "E6": "FCFS vs FAIR 多租户",
-        "E7": "串行加载 vs 双缓冲预取",
+        "E6": "FCFS vs FAIR（1:1 份额）",
+        "E7": "串行 vs 双缓冲 vs 预取+缓存",
         "E8": "无配额越界 vs 显存硬上限",
         "E9": "无超卖 vs 超卖 + balloon",
         "E10": "MPS 份额 1:1 vs 3:1",
@@ -83,7 +85,7 @@ def list_runs(limit: int = 50) -> dict[str, Any]:
     try:
         rows = (
             db.query(database.ExperimentRun)
-            .order_by(ExperimentRun.id.desc())
+            .order_by(database.ExperimentRun.id.desc())
             .limit(limit)
             .all()
         )
